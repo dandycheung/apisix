@@ -39,6 +39,21 @@ local schema = {
         log_format = {type = "object"},
         timeout = {type = "integer", minimum = 1, default = 3},
         include_req_body = {type = "boolean", default = false},
+        include_req_body_expr = {
+            type = "array",
+            minItems = 1,
+            items = {
+                type = "array"
+            }
+        },
+        include_resp_body = { type = "boolean", default = false },
+        include_resp_body_expr = {
+            type = "array",
+            minItems = 1,
+            items = {
+                type = "array"
+            }
+        },
     },
     required = {"endpoint_addr"},
 }
@@ -47,7 +62,9 @@ local schema = {
 local metadata_schema = {
     type = "object",
     properties = {
-        log_format = log_util.metadata_schema_log_format,
+        log_format = {
+            type = "object"
+        }
     },
 }
 
@@ -65,6 +82,8 @@ function _M.check_schema(conf, schema_type)
     if schema_type == core.schema.TYPE_METADATA then
         return core.schema.check(metadata_schema, conf)
     end
+    local check = {"endpoint_addr"}
+    core.utils.check_https(check, conf, plugin_name)
     return core.schema.check(schema, conf)
 end
 
@@ -114,6 +133,11 @@ local function send_http_data(conf, log_message)
 end
 
 
+function _M.body_filter(conf, ctx)
+    log_util.collect_body(conf, ctx)
+end
+
+
 function _M.log(conf, ctx)
     local log_body = log_util.get_log_entry(plugin_name, conf, ctx)
     local trace_context
@@ -132,6 +156,11 @@ function _M.log(conf, ctx)
         end
     end
 
+    local service_instance_name = conf.service_instance_name
+    if service_instance_name == "$hostname" then
+        service_instance_name = core.utils.gethostname()
+    end
+
     local entry = {
         traceContext = trace_context,
         body = {
@@ -140,7 +169,7 @@ function _M.log(conf, ctx)
             }
         },
         service = conf.service_name,
-        serviceInstance = conf.service_instance_name,
+        serviceInstance = service_instance_name,
         endpoint = ctx.var.uri,
     }
 
