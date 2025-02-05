@@ -47,6 +47,7 @@ local type    = type
 local pairs   = pairs
 local ipairs  = ipairs
 local unpack  = unpack
+local string_format = string.format
 
 local lrucache = core.lrucache.new({
     type = 'plugin', count = 128, ttl = 24 * 60 * 60,
@@ -54,7 +55,7 @@ local lrucache = core.lrucache.new({
 
 local asterisk = string.byte("*", 1)
 
-local attr_schema = {
+local metadata_schema = {
     type = "object",
     properties = {
         trace_id_source = {
@@ -111,6 +112,11 @@ local attr_schema = {
                 }
             },
             default = {},
+        },
+        set_ngx_var = {
+          type = "boolean",
+          description = "set nginx variables",
+          default = false,
         },
     },
 }
@@ -186,18 +192,26 @@ local _M = {
     priority = 12009,
     name = plugin_name,
     schema = schema,
-    attr_schema = attr_schema,
+    metadata_schema = metadata_schema,
 }
 
 
-function _M.check_schema(conf)
+function _M.check_schema(conf, schema_type)
+    if schema_type == core.schema.TYPE_METADATA then
+        local ok, err = core.schema.check(metadata_schema, conf)
+        if not ok then
+            return ok, err
+        end
+        local check = {"collector.address"}
+        core.utils.check_https(check, conf, plugin_name)
+        return true
+    end
     return core.schema.check(schema, conf)
 end
 
 
 local hostname
 local sampler_factory
-local plugin_info
 
 function _M.init()
     if process.type() ~= "worker" then
@@ -211,25 +225,16 @@ function _M.init()
         trace_id_ratio = trace_id_ratio_sampler_new,
     }
     hostname = core.utils.gethostname()
+end
 
-    plugin_info = plugin.plugin_attr(plugin_name) or {}
-    local ok, err = core.schema.check(attr_schema, plugin_info)
-    if not ok then
-        core.log.error("failed to check the plugin_attr[", plugin_name, "]",
-                ": ", err)
-        return
-    end
 
+local function create_tracer_obj(conf, plugin_info)
     if plugin_info.trace_id_source == "x-request-id" then
         id_generator.new_ids = function()
             local trace_id = core.request.headers()["x-request-id"] or ngx_var.request_id
             return trace_id, id_generator.new_span_id()
         end
     end
-end
-
-
-local function create_tracer_obj(conf)
     -- create exporter
     local exporter = otlp_exporter_new(exporter_client_new(plugin_info.collector.address,
                                                             plugin_info.collector.request_timeout,
@@ -302,18 +307,43 @@ end
 
 
 function _M.rewrite(conf, api_ctx)
-    local tracer, err = core.lrucache.plugin_ctx(lrucache, api_ctx, nil, create_tracer_obj, conf)
+    local metadata = plugin.plugin_metadata(plugin_name)
+    if metadata == nil then
+        core.log.warn("plugin_metadata is required for opentelemetry plugin to working properly")
+        return
+    end
+    core.log.info("metadata: ", core.json.delay_encode(metadata))
+    local plugin_info = metadata.value
+    local vars = api_ctx.var
+
+    local tracer, err = core.lrucache.plugin_ctx(lrucache, api_ctx, nil,
+                                                create_tracer_obj, conf, plugin_info)
     if not tracer then
         core.log.error("failed to fetch tracer object: ", err)
         return
     end
 
-    -- extract trace context from the headers of downstream HTTP request
-    local upstream_context = trace_context_propagator:extract(context, ngx.req)
+    local span_name = vars.method
+
     local attributes = {
-        attr.string("service", api_ctx.service_name),
-        attr.string("route", api_ctx.route_name),
+        attr.string("net.host.name", vars.host),
+        attr.string("http.method", vars.method),
+        attr.string("http.scheme", vars.scheme),
+        attr.string("http.target", vars.request_uri),
+        attr.string("http.user_agent", vars.http_user_agent),
     }
+
+    if api_ctx.curr_req_matched then
+        table.insert(attributes, attr.string("apisix.route_id", api_ctx.route_id))
+        table.insert(attributes, attr.string("apisix.route_name", api_ctx.route_name))
+        table.insert(attributes, attr.string("http.route", api_ctx.curr_req_matched._path))
+        span_name = span_name .. " " .. api_ctx.curr_req_matched._path
+    end
+
+    if api_ctx.service_id then
+        table.insert(attributes, attr.string("apisix.service_id", api_ctx.service_id))
+        table.insert(attributes, attr.string("apisix.service_name", api_ctx.service_name))
+    end
 
     if conf.additional_attributes then
         inject_attributes(attributes, conf.additional_attributes, api_ctx.var, false)
@@ -328,10 +358,24 @@ function _M.rewrite(conf, api_ctx)
         )
     end
 
-    local ctx = tracer:start(upstream_context, api_ctx.var.request_uri, {
+    -- extract trace context from the headers of downstream HTTP request
+    local upstream_context = trace_context_propagator:extract(context, ngx.req)
+
+    local ctx = tracer:start(upstream_context, span_name, {
         kind = span_kind.server,
         attributes = attributes,
     })
+
+    if plugin_info.set_ngx_var then
+      local span_context = ctx:span():context()
+      ngx_var.opentelemetry_context_traceparent = string_format("00-%s-%s-%02x",
+                                                                 span_context.trace_id,
+                                                                 span_context.span_id,
+                                                                 span_context.trace_flags)
+      ngx_var.opentelemetry_trace_id = span_context.trace_id
+      ngx_var.opentelemetry_span_id = span_context.span_id
+    end
+
     api_ctx.otel_context_token = ctx:attach()
 
     -- inject trace context into the headers of upstream HTTP request
@@ -352,6 +396,8 @@ function _M.delayed_body_filter(conf, api_ctx)
             span:set_status(span_status.ERROR,
                             "upstream response status: " .. upstream_status)
         end
+
+        span:set_attributes(attr.int("http.status_code", upstream_status))
 
         span:finish()
     end

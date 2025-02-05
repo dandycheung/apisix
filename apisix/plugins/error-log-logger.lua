@@ -187,6 +187,11 @@ function _M.check_schema(conf, schema_type)
     if schema_type == core.schema.TYPE_METADATA then
         return core.schema.check(metadata_schema, conf)
     end
+
+    local check = {"skywalking.endpoint_addr", "clickhouse.endpoint_addr"}
+    core.utils.check_https(check, conf, plugin_name)
+    core.utils.check_tls_bool({"tcp.tls"}, conf, plugin_name)
+
     return core.schema.check(schema, conf)
 end
 
@@ -237,10 +242,15 @@ local function send_to_skywalking(log_message)
     httpc:set_timeout(config.timeout * 1000)
 
     local entries = {}
+    local service_instance_name = config.skywalking.service_instance_name
+    if service_instance_name == "$hostname" then
+        service_instance_name = core.utils.gethostname()
+    end
+
     for i = 1, #log_message, 2 do
         local content = {
             service = config.skywalking.service_name,
-            serviceInstance = config.skywalking.service_instance_name,
+            serviceInstance = service_instance_name,
             endpoint = "",
             body = {
                 text = {
